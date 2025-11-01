@@ -1,5 +1,6 @@
 import functools
 from typing import Callable
+from datasets.load import load_dataset
 import pandas as pd
 import plotly.express as px
 import torch as t
@@ -10,6 +11,7 @@ from transformer_lens import ActivationCache, HookedTransformer, utils
 from transformer_lens.hook_points import HookPoint
 
 MODEL_NAME = "gpt2-small"
+IOI_DATASET = "danaarad/ioi_dataset"
 
 PROMPT_TEMPLATES = [
     "While John and Mary went to the science fair,{} shared the project with",
@@ -424,6 +426,22 @@ def activation_patching(
     fig.show()
 
 
+def path_tracing(model: HookedTransformer) -> None:
+    dataset = load_dataset(IOI_DATASET, split="train")
+    prompt_templates = dataset["prompt"]
+    choices = dataset["choices"]
+
+    table = Table(
+        "Prompt",
+        Column("Correct"),
+        Column("Incorrect"),
+        title="Logit differences",
+    )
+
+    for prompt, answers in zip(prompt_templates, choices):
+        table.add_row(str(prompt), repr(answers[0]), repr(answers[1]))
+
+
 def main() -> None:
     t.set_grad_enabled(False)
 
@@ -461,6 +479,19 @@ def main() -> None:
     correct_residual_dir, incorrect_residual_dir = answers_residual_dir.unbind(dim=1)
     logit_diff_dir = correct_residual_dir - incorrect_residual_dir
 
-    head_attribution(cache, logit_diff_dir)
+    head_attribution(
+        cache,
+        logit_diff_dir
+    )
 
-    activation_patching(model, tokens, answers, device=device)
+    activation_patching(
+        model,
+        tokens,
+        answers,
+        device=device
+    )
+
+    path_tracing(
+        model,
+    )
+
