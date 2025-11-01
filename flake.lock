@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "flake-parts": {
+      "inputs": {
+        "nixpkgs-lib": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1760948891,
+        "narHash": "sha256-TmWcdiUUaWk8J4lpjzu4gCGxWY6/Ok7mOK4fIFfBuU4=",
+        "owner": "hercules-ci",
+        "repo": "flake-parts",
+        "rev": "864599284fc7c0ba6357ed89ed5e2cd5040f0c04",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hercules-ci",
+        "repo": "flake-parts",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1761785401,
+        "narHash": "sha256-PKG8NzUgzoac3iAe12zo2EjcXJTAPWE+2dh0+t35J4M=",
+        "rev": "08dacfca559e1d7da38f3cf05f1f45ee9bfd213c",
+        "type": "tarball",
+        "url": "https://releases.nixos.org/nixos/unstable/nixos-25.11pre886100.08dacfca559e/nixexprs.tar.xz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
+      }
+    },
+    "root": {
+      "inputs": {
+        "flake-parts": "flake-parts",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
