@@ -1,10 +1,13 @@
+import functools
+from typing import Callable
 import pandas as pd
 import plotly.express as px
 import torch as t
 from rich import print as rprint
 from rich.table import Column, Table
 from torch import Tensor
-from transformer_lens import ActivationCache, HookedTransformer, patching
+from transformer_lens import ActivationCache, HookedTransformer, utils
+from transformer_lens.hook_points import HookPoint
 
 MODEL_NAME = "gpt2-small"
 
@@ -63,13 +66,26 @@ def tokenize_ioi_name_pairs(model: HookedTransformer) -> Tensor:
     """
     Return the tokenized array of correct/incorrect name pairs for the dataset created by
     `make_ioi_dataset`.
+
+    Args:
+        model (HookedTransformer): The model to tokenize the name pairs for
+
+    Returns:
+        Tensor: A tokenized name pairs tensor
     """
     answers = make_name_pairs()
-    tokens = t.concat([model.to_tokens(names, prepend_bos=False).T for names in answers])
+    tokens = t.concat([model.to_tokens(list(names), prepend_bos=False).T for names in answers])
     return tokens
 
 
 def get_ioi_token_logits(logits: Tensor, answer: Tensor) -> Tensor:
+    """
+    Returns token logits for correct and incorrect IOI predictions
+
+    Args:
+        logits (Tensor): All token logits from the model feedforward, with a dimensionality d_vocab
+        answer (Tensor): The tokenized name pairs to retrieve the logits for
+    """
     last_pos_logits = logits[:, -1, :]
     logits = last_pos_logits.gather(dim=-1, index=answer)
     return logits
@@ -80,6 +96,20 @@ def residual_stack_to_logit_diff(
     cache: ActivationCache,
     logit_diff_dir: Tensor,
 ) -> Tensor:
+    """
+    Maps a residual stream to a logit difference scalar.
+
+    This is helpful for finding how much the given residual prefers the correct or incorrect token.
+
+    Args:
+        residual_stack (Tensor): The residual stream tensor
+        cache (ActivationCache): The KV cache of the feedforward that generated the residual stream
+        logit_diff_dir (Tensor): The contrastive direction between the correct and incorrect
+            unembedding vectors
+
+    Returns:
+        Tensor: The logit difference scalar
+    """
     batch_size = residual_stack.size()[-2]
     scaled_residual_stack = cache.apply_ln_to_stack(residual_stack, layer=-1, pos_slice=-1)
     return t.einsum("...bd,bd->...", scaled_residual_stack, logit_diff_dir) / batch_size
@@ -90,6 +120,17 @@ def logit_ioi(
     sentences: list[str],
     logits: Tensor,
 ) -> Tensor:
+    """
+    Displays logit differences for correct and incorrect predictions for each sentence.
+
+    Args:
+        model (HookedTransformer): The model which uses the tokenizer used for the logits
+        sentences (list[str]): A list of prompts with next-word predictions
+        logits (Tensor): The next-word predictions for each sentence
+
+    Returns:
+        Tensor: The logit difference for each sentence
+    """
     answers = tokenize_ioi_name_pairs(model)
     token_logits = get_ioi_token_logits(logits, answers)
     answer_pairs = make_name_pairs()
@@ -119,10 +160,21 @@ def ioi_metric(
     answer_tokens: Tensor,
     clean_logit_diff: float,
     corrupt_logit_diff: float,
-) -> Tensor:
+) -> float:
     """
-    clean_corrupt_diff = 1.4
-    corrupt_logit_diff = -1.0
+    A simple indirect object identification metric.
+
+    Args:
+        logits (Tensor): The logits of the next-word prediction
+        answer_tokens (Tensor): The tokens corresponding to the correct and incorrect words
+        clean_logit_diff (float): The logit difference between correct and incorrect in the clean
+            activations
+        corrupt_logit_diff (float): The logit difference between correct and incorrect in the
+            corrupted activations
+
+    Returns:
+        float: A scalar which describes how likely the clean logit difference was in a corrupted
+            activation-patched inference
     """
     clean = clean_logit_diff - corrupt_logit_diff
     patched = get_ioi_token_logits(logits, answer_tokens) - corrupt_logit_diff
@@ -136,6 +188,16 @@ def layer_ioi_attribution(
     original_logit_diff: Tensor,
     cache: ActivationCache,
 ) -> None:
+    """
+    Explains indirect object identification layer-wise.
+
+    Args:
+        model (HookedTransformer): The model to use
+        answers (Tensor): The correct and incorrect answer tokens
+        sentences (list[str]): The prompts to test for IOI attribution
+        original_logit_diff (Tensor): The logit difference for inferences with no layer ablation
+        cache (ActivationCache): The activation cache of the clean inference
+    """
     # Logit attribution
     answers_residual_dir = model.tokens_to_residual_directions(answers)
     correct_residual_dir, incorrect_residual_dir = answers_residual_dir.unbind(dim=1)
@@ -183,6 +245,13 @@ def layer_ioi_attribution(
 
 
 def head_attribution(cache: ActivationCache, logit_diff_dir: Tensor) -> None:
+    """
+    Finds indirect object identifcation attribution at the attention head level per layer.
+
+    Args:
+        cache (ActivationCache): The clean activation cache used
+        logit_diff_dir (Tensor): The logit difference unembedding directions
+    """
     head_resid, labels = cache.stack_head_results(layer=-1, pos_slice=-1, return_labels=True)
     logit_diffs = residual_stack_to_logit_diff(head_resid, cache, logit_diff_dir)
 
@@ -194,6 +263,50 @@ def head_attribution(cache: ActivationCache, logit_diff_dir: Tensor) -> None:
     )
 
     fig.show()
+
+
+def patch_residual_component(
+    corrupt_residual: Tensor,
+    hook: HookPoint,
+    pos: int,
+    clean_cache: ActivationCache,
+) -> Tensor:
+    """
+    A forward hook which patches a clean residual to a corrupted inference.
+
+    Args:
+        corrupted_residual: The current residual stream which is corrupted
+        hook: An object detailing where this hook was called
+        pos: The current sequence position of this patch
+        clean_cache: The activation cache of the clean inference
+    """
+    corrupt_residual[:, pos, :] = clean_cache[hook.name][:, pos, :]
+    return corrupt_residual
+
+
+def get_act_patch_resid_pre_custom(
+    model: HookedTransformer,
+    corrupt_tokens: Tensor,
+    clean_cache: ActivationCache,
+    patching_metric: Callable[[Tensor], float],
+    device: t.device | None = None,
+) -> Tensor:
+    model.reset_hooks()
+
+    n_layers = model.cfg.n_layers
+    seq_len = corrupt_tokens.size(1)
+    results = t.zeros(n_layers, seq_len, device=device, dtype=t.float32)
+
+    for layer in range(n_layers):
+        for pos in range(seq_len):
+            hook_fn = functools.partial(patch_residual_component, pos=pos, clean_cache=clean_cache)
+            logits = model.run_with_hooks(
+                corrupt_tokens,
+                fwd_hooks=[(utils.get_act_name("resid_pre", layer), hook_fn)],
+            )
+            results[layer, pos] = patching_metric(logits)
+
+    return results
 
 
 def activation_patching(model: HookedTransformer, tokens: Tensor, answer_tokens: Tensor) -> None:
@@ -225,11 +338,11 @@ def activation_patching(model: HookedTransformer, tokens: Tensor, answer_tokens:
 
         return metric
 
-    act_patch_resid_pre = patching.get_act_patch_resid_pre(
-        model=model,
-        corrupted_tokens=corrupt_tokens,
-        clean_cache=clean_cache,
-        patching_metric=patching_metric,
+    act_patch_resid_pre = get_act_patch_resid_pre_custom(
+        model,
+        corrupt_tokens,
+        clean_cache,
+        patching_metric,
     )
 
     labels = [
