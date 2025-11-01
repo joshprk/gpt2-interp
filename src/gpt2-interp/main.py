@@ -309,7 +309,52 @@ def get_act_patch_resid_pre_custom(
     return results
 
 
-def activation_patching(model: HookedTransformer, tokens: Tensor, answer_tokens: Tensor) -> None:
+def patch_head_vector(
+    corrupt_head_vector: Tensor,
+    hook: HookPoint,
+    head_idx: int,
+    clean_cache: ActivationCache,
+) -> Tensor:
+    corrupt_head_vector[:, :, head_idx] = clean_cache[hook.name][:, :, head_idx]
+    return corrupt_head_vector
+
+
+def get_act_patch_attn_head_out_custom(
+    model: HookedTransformer,
+    corrupt_tokens: Tensor,
+    clean_cache: ActivationCache,
+    patching_metric: Callable[[Tensor], float],
+    device: t.device | None = None,
+) -> Tensor:
+    model.reset_hooks()
+
+    n_heads = model.cfg.n_heads
+    n_layers = model.cfg.n_layers
+    results = t.zeros(n_heads, n_layers, device=device, dtype=t.float32)
+
+    for head in range(n_heads):
+        for layer in range(n_layers):
+            hook_fn = functools.partial(
+                patch_head_vector,
+                head_idx=head,
+                clean_cache=clean_cache,
+            )
+            logits = model.run_with_hooks(
+                corrupt_tokens,
+                fwd_hooks=[(utils.get_act_name("z", layer), hook_fn)],
+                return_type="logits",
+            )
+            results[head, layer] = patching_metric(logits)
+
+    return results
+
+
+def activation_patching(
+    model: HookedTransformer,
+    tokens: Tensor,
+    answer_tokens: Tensor,
+    device: t.device | None = None,
+) -> None:
     indices = [i + 1 if i % 2 == 0 else i - 1 for i in range(len(tokens))]
     clean_tokens = tokens
     corrupt_tokens = clean_tokens[indices]
@@ -328,7 +373,7 @@ def activation_patching(model: HookedTransformer, tokens: Tensor, answer_tokens:
     corrupt, incorrect = corrupt_logit_diff.unbind(dim=-1)
     corrupt_logit_diff = (corrupt - incorrect).mean()
 
-    def patching_metric(logits: Tensor) -> Tensor:
+    def patching_metric(logits: Tensor) -> float:
         metric = ioi_metric(
             logits,
             answer_tokens,
@@ -343,6 +388,7 @@ def activation_patching(model: HookedTransformer, tokens: Tensor, answer_tokens:
         corrupt_tokens,
         clean_cache,
         patching_metric,
+        device=device,
     )
 
     labels = [
@@ -355,6 +401,23 @@ def activation_patching(model: HookedTransformer, tokens: Tensor, answer_tokens:
         labels={"x": "Position", "y": "Layer"},
         x=labels,
         title="Activation patching",
+        width=700,
+    )
+
+    fig.show()
+
+    act_patch_attn_head_out = get_act_patch_attn_head_out_custom(
+        model,
+        corrupt_tokens,
+        clean_cache,
+        patching_metric,
+        device=device,
+    )
+
+    fig = px.imshow(
+        act_patch_attn_head_out.cpu(),
+        labels={"x": "Layer", "y": "Head"},
+        title="Activation patching per activation head out",
         width=700,
     )
 
@@ -400,4 +463,4 @@ def main() -> None:
 
     head_attribution(cache, logit_diff_dir)
 
-    activation_patching(model, tokens, answers)
+    activation_patching(model, tokens, answers, device=device)
